@@ -1,0 +1,8 @@
+# Example OpenML regression dataset IDs for corpus finetuning.
+# One ID per line. Lines starting with '#' are ignored.
+534
+43928
+531
+37
+277
+44087

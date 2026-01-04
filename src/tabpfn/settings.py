@@ -35,6 +35,12 @@ class TabPFNSettings(BaseSettings):
         default=ModelVersion.V2_5,
         description="The version of the TabPFN model to use by default.",
     )
+    disable_model_download: bool = Field(
+        default=False,
+        description="Disable automatic downloading of TabPFN model weights. "
+        "If True and no local `model_path` is provided, TabPFN will initialize "
+        "random weights instead of downloading a checkpoint.",
+    )
 
     # Performance/Memory Settings
     allow_cpu_large_dataset: bool = Field(

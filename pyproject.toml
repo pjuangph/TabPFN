@@ -23,7 +23,7 @@ dependencies = [
   "joblib>=1.2.0",
   "tabpfn-common-utils[telemetry-interactive]>=0.2.8",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.9,<4.0"
 authors = [
   { name = "Noah Hollmann" },
   { name = "Samuel Müller" },

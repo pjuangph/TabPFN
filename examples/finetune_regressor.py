@@ -145,6 +145,10 @@ def main() -> None:
     X_train, X_test, y_train, y_test = prepare_data(config)
     regressor, regressor_config = setup_regressor(config)
 
+    # TabPFN lazily initializes the internal torch model; do it explicitly since we
+    # access `models_` for fine-tuning.
+    regressor._initialize_model_variables()
+
     if len(regressor.models_) > 1:
         raise ValueError(
             f"Your TabPFNRegressor uses multiple models ({len(regressor.models_)}). "
@@ -200,7 +204,7 @@ def main() -> None:
                 ) = data_batch
 
                 regressor.raw_space_bardist_ = raw_space_bardist_[0]
-                regressor.bardist_ = znorm_space_bardist_[0]
+                regressor.znorm_space_bardist_ = znorm_space_bardist_[0]
                 regressor.fit_from_preprocessed(
                     X_trains_preprocessed, y_trains_znorm, cat_ixs, confs
                 )

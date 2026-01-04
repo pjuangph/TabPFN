@@ -1,0 +1,87 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "TabPFN: Train from scratch mlp (California Housing)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_from_scratch_housing_regression.py",
+            "args": [
+                "--dataset",
+                "california",
+                "--epochs",
+                "1000",
+                "--batch-size",
+                "128",
+                "--save-every",
+                "1000"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "TabPFN: Fit pretrained regressor (California Housing)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_tabpfn_housing_regression.py",
+            "args": [
+                "--dataset",
+                "california",
+                "--n-estimators",
+                "4"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "TabPFN: Train from scratch (California Housing)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/train_tabpfn_from_scratch_housing_regression.py",
+            "args": [
+                "--dataset",
+                "california",
+                "--epochs",
+                "1000",
+                "--context-samples",
+                "2000",
+                "--lr",
+                "0.0003"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "TabPFN: Finetune OpenML regression corpus (small)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/finetune_openml_regression_corpus.py",
+            "args": [
+                "--from-file",
+                "${workspaceFolder}/examples/openml_regression_ids.txt",
+                "--epochs",
+                "100",
+                "--max-rows",
+                "20000",
+                "--context-samples",
+                "2000",
+                "--eval-every-datasets",
+                "1",
+                "--save-every-datasets",
+                "100"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        }
+    ]
+}

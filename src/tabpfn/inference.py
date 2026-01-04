@@ -468,7 +468,7 @@ class InferenceEngineBatchedNoPreprocessing(SingleDeviceInferenceEngine):
         X: list[torch.Tensor],
         *,
         autocast: bool,
-    ) -> Iterator[tuple[torch.Tensor | dict, list[EnsembleConfig]]]:
+    ) -> Iterator[tuple[torch.Tensor | dict, list[EnsembleConfig]]]: # Note: This is where the transformer happens 
         device = _get_current_device(self.models[0])
         batch_size = len(self.X_trains)
         for i in range(batch_size):

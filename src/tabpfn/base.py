@@ -13,6 +13,7 @@ import torch
 from tabpfn_common_utils.telemetry.interactive import capture_session, ping
 
 from tabpfn.architectures.base.bar_distribution import FullSupportBarDistribution
+from tabpfn.architectures import ARCHITECTURES
 
 # --- TabPFN imports ---
 from tabpfn.constants import (
@@ -29,7 +30,13 @@ from tabpfn.inference import (
     InferenceEngineCachePreprocessing,
     InferenceEngineOnDemand,
 )
-from tabpfn.model_loading import load_model_criterion_config, resolve_model_version
+from tabpfn.inference_config import InferenceConfig
+from tabpfn.model_loading import (
+    get_loss_criterion,
+    get_n_out,
+    load_model_criterion_config,
+    resolve_model_version,
+)
 from tabpfn.preprocessing import (
     BaseDatasetConfig,
     ClassifierDatasetConfig,
@@ -55,6 +62,67 @@ if TYPE_CHECKING:
     from tabpfn.classifier import TabPFNClassifier
     from tabpfn.inference_config import InferenceConfig
     from tabpfn.regressor import TabPFNRegressor
+
+
+def _initialize_random_tabpfn_foundation_model(
+    *,
+    which: Literal["classifier", "regressor"],
+    fit_mode: Literal["low_memory", "fit_preprocessors", "fit_with_cache"],
+    architecture_name: str = "base",
+    seed: int = 0,
+    num_buckets: int = 100,
+    max_num_classes: int = 10,
+) -> tuple[
+    list["Architecture"],
+    list["ArchitectureConfig"],
+    FullSupportBarDistribution | None,
+    "InferenceConfig",
+]:
+    """Initialize a random-weight TabPFN foundation model (no checkpoint download).
+
+    This is intended for experimentation/inspection (e.g., attention patterns,
+    tokenization/encoders), and will not provide meaningful performance without
+    substantial training.
+    """
+    architecture = ARCHITECTURES[architecture_name]
+    cache_trainset_representation = fit_mode == "fit_with_cache"
+
+    if which == "regressor":
+        config_dict = {
+            "max_num_classes": 0,
+            "num_buckets": int(num_buckets),
+            "seed": int(seed),
+        }
+        task_type = "regression"
+    else:
+        config_dict = {
+            "max_num_classes": int(max_num_classes),
+            "num_buckets": 0,
+            "seed": int(seed),
+        }
+        task_type = "multiclass"
+
+    torch.manual_seed(int(seed))
+    model_config, _unused = architecture.parse_config(config_dict)
+    criterion = get_loss_criterion(model_config)
+    # `get_loss_criterion()` returns intentionally "obviously wrong" dummy borders for
+    # regression when not loading from a checkpoint. For scratch training/inspection
+    # we want a sensible default scale in znorm space.
+    if which == "regressor" and isinstance(criterion, FullSupportBarDistribution):
+        borders = torch.linspace(-3.0, 3.0, steps=int(num_buckets) + 1)
+        criterion = FullSupportBarDistribution(borders=borders, ignore_nan_targets=True)
+    model = architecture.get_architecture(
+        model_config,
+        n_out=get_n_out(model_config, criterion),
+        cache_trainset_representation=cache_trainset_representation,
+    )
+    model.eval()
+
+    inference_config = InferenceConfig.get_default(
+        task_type, model_version="latest"  # type: ignore[arg-type]
+    )
+    norm_criterion = criterion if isinstance(criterion, FullSupportBarDistribution) else None
+    return [model], [model_config], norm_criterion, inference_config
 
 
 class BaseModelSpecs:
@@ -182,6 +250,26 @@ def initialize_tabpfn_model(
 
         if isinstance(model_path, str) and model_path == "auto":
             model_path = None  # type: ignore
+
+        if isinstance(model_path, str):
+            mp = model_path.lower()
+            if mp in {"random", "scratch"} or mp.startswith(("random:", "scratch:")):
+                seed = 0
+                if ":" in mp:
+                    _, seed_str = mp.split(":", 1)
+                    seed = int(seed_str)
+                return _initialize_random_tabpfn_foundation_model(
+                    which=which,
+                    fit_mode=fit_mode,
+                    seed=seed,
+                )
+
+        if model_path is None and settings.tabpfn.disable_model_download:
+            return _initialize_random_tabpfn_foundation_model(
+                which=which,
+                fit_mode=fit_mode,
+                seed=0,
+            )
 
         version = resolve_model_version(model_path)  # type: ignore
         download_if_not_exists = True
