@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import platform
 from functools import partial
 from pathlib import Path
 
@@ -39,6 +40,14 @@ from housing_regression_utils import (
 )
 
 
+def auto_detect_device() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        mps_ok = bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
+        return "mps" if mps_ok else "cpu"
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
 def evaluate(
     regressor: TabPFNRegressor,
     eval_config: dict,
@@ -60,14 +69,14 @@ def evaluate(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["california", "ames"], default="california")
+    parser.add_argument("--dataset", choices=["california", "ames"], default="ames")
     parser.add_argument(
         "--device",
-        default="cuda:0" if torch.cuda.is_available() else "cpu",
-        help="Device for training/inference (e.g. 'cuda:0' or 'cpu').",
+        default="auto",
+        help="Device for training/inference (e.g. 'auto', 'mps', 'cuda:0', or 'cpu').",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-rows", type=int, default=50_000)
+    parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -82,10 +91,17 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    if str(args.device).lower() == "auto":
+        args.device = auto_detect_device()
+
     if str(args.device).startswith("cuda"):
         if not torch.cuda.is_available():
             raise RuntimeError("Requested CUDA device but torch.cuda.is_available() is False.")
         torch.backends.cudnn.benchmark = True
+    elif str(args.device) == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if not mps_backend or not torch.backends.mps.is_available():
+            raise RuntimeError("Requested MPS device but torch.backends.mps.is_available() is False.")
 
     X_df, y = load_housing_regression_dataset(args.dataset, args.max_rows, args.seed)
     X_train, X_test, y_train, y_test = split_train_test(
