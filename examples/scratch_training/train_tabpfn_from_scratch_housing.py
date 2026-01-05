@@ -2,14 +2,24 @@
 
 This script initializes the TabPFN foundation model with random weights
 (`model_path="random:<seed>"`) so **no checkpoint download occurs**, then trains the
-weights with gradient descent on a single regression dataset.
+weights with gradient descent on one regression dataset.
 
-This is intentionally for learning/inspection (e.g., encoders + attention behavior).
-It is not TabPFN's original pretraining recipe and will likely perform poorly.
+Important terminology used here:
 
-Usage:
-  python examples/train_tabpfn_from_scratch_housing_regression.py --dataset california
-  python examples/train_tabpfn_from_scratch_housing_regression.py --dataset ames --max-rows 20000
+- `context_size` / `--context-samples`:
+  Number of *training rows* included in the TabPFN "prompt" at once.
+  TabPFN uses attention over (train + test) rows, so memory grows quickly with
+  sequence length. Smaller contexts are the standard way to train/evaluate on large
+  datasets.
+
+- `eval_batch_size` / `--eval-batch-size`:
+  Number of *test rows* sent through `predict()` per call during evaluation. This is
+  unrelated to training mini-batches; it simply limits the test-side sequence length
+  in a single forward pass.
+
+- PyTorch `DataLoader(batch_size=1)`:
+  This batches *datasets/contexts*, not rows. Each item yielded by
+  `regressor.get_preprocessed_datasets(...)` already represents one sampled context.
 """
 
 from __future__ import annotations
@@ -22,8 +32,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
-from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -38,6 +48,12 @@ from housing_regression_utils import (
     make_run_prefix,
     split_train_test,
 )
+from context_sampling import (
+    EvalBatching,
+    build_epoch_contexts,
+    predict_with_context_batched,
+    sample_train_context_indices,
+)
 
 
 def auto_detect_device() -> str:
@@ -48,18 +64,41 @@ def auto_detect_device() -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
-def evaluate(
+def evaluate_with_contexts(
+    *,
     regressor: TabPFNRegressor,
-    eval_config: dict,
+    init_args: dict,
     X_train,
     y_train: np.ndarray,
     X_test,
     y_test: np.ndarray,
+    batching: EvalBatching,
 ) -> dict[str, float]:
-    eval_reg = clone_model_for_evaluation(regressor, eval_config, TabPFNRegressor)
-    eval_reg.fit(X_train, y_train)
-    pred = np.asarray(eval_reg.predict(X_test), dtype=np.float32)
+    """Evaluate without ever building a (full train + full test) attention context."""
+    rng = np.random.default_rng(batching.seed)
+    eval_reg = clone_model_for_evaluation(regressor, init_args, TabPFNRegressor)
+
+    n_test = len(X_test)
+    sum_pred = np.zeros(n_test, dtype=np.float64)
+    used_contexts = 0
+
+    for _ in range(batching.n_contexts):
+        idx = sample_train_context_indices(len(X_train), context_size=batching.context_size, rng=rng)
+        X_ctx = X_train.iloc[idx] if hasattr(X_train, "iloc") else X_train[idx]
+        y_ctx = y_train[idx]
+        pred = predict_with_context_batched(
+            regressor=eval_reg,
+            X_ctx=X_ctx,
+            y_ctx=y_ctx,
+            X_test=X_test,
+            test_batch_size=batching.test_batch_size,
+        )
+        sum_pred += pred.astype(np.float64, copy=False)
+        used_contexts += 1
+
+    pred = (sum_pred / float(used_contexts)).astype(np.float32, copy=False)
     y_true = np.asarray(y_test, dtype=np.float32)
+
     mse = float(np.mean((pred - y_true) ** 2))
     mae = float(np.mean(np.abs(pred - y_true)))
     denom = float(np.sum((y_true - float(y_true.mean())) ** 2))
@@ -81,7 +120,27 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--context-samples", type=int, default=2000)
+    parser.add_argument(
+        "--context-samples",
+        type=int,
+        default=512,
+        help=(
+            "Context size (number of training rows) per TabPFN prompt. "
+            "This is the main knob for memory use."
+        ),
+    )
+    parser.add_argument(
+        "--eval-contexts",
+        type=int,
+        default=1,
+        help="Number of random training contexts to average over during evaluation.",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=512,
+        help="Number of test rows per predict() call during evaluation.",
+    )
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -104,15 +163,13 @@ def main() -> None:
             raise RuntimeError("Requested MPS device but torch.backends.mps.is_available() is False.")
 
     X_df, y = load_housing_regression_dataset(args.dataset, args.max_rows, args.seed)
-    X_train, X_test, y_train, y_test = split_train_test(
-        X_df, y, test_size=args.test_size, seed=args.seed
-    )
+    X_train, X_test, y_train, y_test = split_train_test(X_df, y, test_size=args.test_size, seed=args.seed)
 
     run_prefix = make_run_prefix(args.dataset, model_name="tabpfn_scratch", seed=args.seed)
     save_dir = default_save_dir(__file__, args.save_dir)
     metrics_path = save_dir / f"{run_prefix}_metrics.jsonl"
 
-    regressor_config = {
+    regressor_init = {
         "device": args.device,
         "random_state": args.seed,
         "n_estimators": 1,
@@ -120,48 +177,70 @@ def main() -> None:
         "inference_precision": torch.float32,
         "model_path": f"random:{args.seed}",
     }
-    regressor = TabPFNRegressor(**regressor_config, fit_mode="batched", differentiable_input=False)
+    regressor = TabPFNRegressor(**regressor_init, fit_mode="batched", differentiable_input=False)
 
-    # TabPFN lazily initializes internal modules; do it explicitly since we need access
-    # to the underlying torch model for weight training.
     regressor._initialize_model_variables()
-
     if len(regressor.models_) != 1:
         raise ValueError(f"Expected exactly 1 internal model, got {len(regressor.models_)}.")
     model = regressor.models_[0]
     model.train()
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    eval_config = {k: v for k, v in regressor_config.items() if k != "model_path"}
+
+    eval_batching = EvalBatching(
+        context_size=args.context_samples,
+        n_contexts=args.eval_contexts,
+        test_batch_size=args.eval_batch_size,
+        seed=args.seed,
+    )
+
+    eval_init_args = {k: v for k, v in regressor_init.items() if k != "model_path"}
 
     print(f"Dataset: {args.dataset} | Train: {len(X_train)} | Test: {len(X_test)}")
     print(f"Device: {args.device} | model_path=random:{args.seed}")
+    print(f"Context: {args.context_samples} train rows | Eval batch: {args.eval_batch_size} test rows")
     if str(args.device).startswith("cuda"):
         print(f"CUDA device: {torch.cuda.get_device_name(torch.device(args.device))}")
     print(f"Saving to: {save_dir} | Run prefix: {run_prefix}")
 
-    initial = evaluate(regressor, eval_config, X_train, y_train, X_test, y_test)
+    initial = evaluate_with_contexts(
+        regressor=regressor,
+        init_args=eval_init_args,
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        batching=eval_batching,
+    )
     print(f"Initial | MSE: {initial['mse']:.4f} | MAE: {initial['mae']:.4f} | R2: {initial['r2']:.4f}")
     append_jsonl(metrics_path, {"epoch": 0, "event": "eval", **{f"test_{k}": v for k, v in initial.items()}})
 
     splitter = partial(train_test_split, test_size=args.test_size, random_state=args.seed)
-    # Datasets are normalized here
-    training_datasets = regressor.get_preprocessed_datasets(
-        X_train,
-        y_train,
-        splitter,
-        max_data_size=min(args.context_samples, len(X_train)),
-    )   
-    dataloader = DataLoader(training_datasets, batch_size=1, collate_fn=meta_dataset_collator)
+    rng = np.random.default_rng(args.seed)
 
     global_step = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
-        progress = tqdm(
-            dataloader,
-            desc=f"Scratch train epoch {epoch}/{args.epochs}",
-            unit="batch",
+
+        # One epoch = iterate over many contexts built from the full dataset.
+        X_contexts, y_contexts = build_epoch_contexts(
+            X_train,
+            y_train,
+            context_size=args.context_samples,
+            rng=rng,
         )
+
+        training_datasets = regressor.get_preprocessed_datasets(
+            X_contexts,
+            y_contexts,
+            splitter,
+            max_data_size=None,
+        )
+
+        # `batch_size=1` here means "one dataset/context per step".
+        dataloader = DataLoader(training_datasets, batch_size=1, collate_fn=meta_dataset_collator)
+
+        progress = tqdm(dataloader, desc=f"Scratch train epoch {epoch}/{args.epochs}", unit="batch")
         epoch_losses: list[float] = []
         epoch_grad_norms: list[float] = []
 
@@ -189,16 +268,13 @@ def main() -> None:
             loss.backward()
             grad_norm = float(clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm))
             optimizer.step()
+
             global_step += 1
             loss_val = float(loss.detach().cpu())
             epoch_losses.append(loss_val)
             epoch_grad_norms.append(grad_norm)
             if args.log_every > 0 and (global_step % args.log_every == 0):
-                progress.set_postfix(
-                    loss=f"{loss_val:.4f}",
-                    grad=f"{grad_norm:.3e}",
-                    step=str(global_step),
-                )
+                progress.set_postfix(loss=f"{loss_val:.4f}", grad=f"{grad_norm:.3e}", step=str(global_step))
 
         if epoch_losses:
             avg_loss = float(np.mean(epoch_losses))
@@ -215,7 +291,15 @@ def main() -> None:
                 },
             )
 
-        metrics = evaluate(regressor, eval_config, X_train, y_train, X_test, y_test)
+        metrics = evaluate_with_contexts(
+            regressor=regressor,
+            init_args=eval_init_args,
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            batching=eval_batching,
+        )
         print(f"Epoch {epoch} | MSE: {metrics['mse']:.4f} | MAE: {metrics['mae']:.4f} | R2: {metrics['r2']:.4f}")
         append_jsonl(metrics_path, {"epoch": epoch, "event": "eval", **{f"test_{k}": v for k, v in metrics.items()}})
 
@@ -235,3 +319,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
