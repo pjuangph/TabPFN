@@ -7,9 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.3.2] - 2026-01-30
+
 ### Added
 
-### Changed
+- - Moved preprocessing-related code to dedicated modules inside `src/tabpfn/preprocessing/`
+  - Renamed public functions: 
+      - `validate_X_predict` → `ensure_compatible_predict_input_sklearn`
+      - `validate_Xy_fit` → `ensure_compatible_fit_inputs_sklearn`
+
+  ([#720](https://github.com/PriorLabs/TabPFN/pull/720))
+- - Add new features to finetuning (metric selection, time limit, passing validation data)
+    - Added `eval_metric` and `time_limit` parameters to `FinetunedTabPFNClassifier` and `FinetunedTabPFNRegressor` 
+    - Added `X_val`, `y_val` parameters to `.fit()` of `FinetunedTabPFNClassifier` and `FinetunedTabPFNRegressor` 
+  - Fix bug in finetuning for splitting very small datasets
+  - Ensure finetuning compares to the default checkpoint and does not accept worse models after finetuning
+
+  ([#730](https://github.com/PriorLabs/TabPFN/pull/730))
+- - Ensure `TabPFNValidationError` wraps both custom and sklearn's validate_data() errors ([#732](https://github.com/PriorLabs/TabPFN/pull/732))
+- Refactor of model encoder. Move imports from `tabpfn.architectures.base.encoders` to `tabpfn.architectures.encoders` ([#733](https://github.com/PriorLabs/TabPFN/pull/733))
+- Renamed the estimator's `preprocessor_` attribute to `ordinal_encoder_` ([#756](https://github.com/PriorLabs/TabPFN/pull/756))
+
+
+## [6.3.1] - 2026-01-14
+
+### Added
+
+- Ensure `TabPFNValidationError` wraps both custom and sklearn's validate_data() errors
+
+## [6.3.0] - 2026-01-06
+
+### Added
+
+- Fix sklearn issue making new tests fail by @noahho in https://github.com/PriorLabs/TabPFN/pull/698
+- Fix KDI transformer init signature for sklearn compatibility by @noahho in https://github.com/PriorLabs/TabPFN/pull/696
+- Improved analytics for tracking usage of different fit modes by @safaricd in https://github.com/PriorLabs/TabPFN/pull/646
+- Add finetuning wrapper for classifier by @bejaeger in https://github.com/PriorLabs/TabPFN/pull/701
+- Add Enterprise Edition section to README by @noahho in https://github.com/PriorLabs/TabPFN/pull/704
+- [WIP] Refactor preprocessing into preprocessors package by @noahho in https://github.com/PriorLabs/TabPFN/pull/697
+- Make fitted attributes safe by @noahho in https://github.com/PriorLabs/TabPFN/pull/707
+- Document available checkpoints on Hugging Face by @LeoGrin in https://github.com/PriorLabs/TabPFN/pull/690
+- Custom error for input validation by @simo-prior in https://github.com/PriorLabs/TabPFN/pull/692
 
 ## [6.2.0] - 2025-12-18
 

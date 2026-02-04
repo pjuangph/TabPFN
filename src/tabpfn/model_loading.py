@@ -24,6 +24,7 @@ from urllib.error import URLError
 
 import joblib
 import torch
+from filelock import FileLock
 from tabpfn_common_utils.telemetry import set_model_config
 from torch import nn
 
@@ -33,6 +34,7 @@ from tabpfn.architectures.base.bar_distribution import (
     FullSupportBarDistribution,
 )
 from tabpfn.constants import ModelVersion
+from tabpfn.errors import TabPFNHuggingFaceGatedRepoError
 from tabpfn.inference import InferenceEngine
 from tabpfn.inference_config import InferenceConfig
 from tabpfn.settings import settings
@@ -174,7 +176,6 @@ def _try_huggingface_downloads(
         model_name: Optional specific model name to download.
         suppress_warnings: Whether to suppress HF token warnings.
     """
-    """Try to download models and config using the HuggingFace Hub API."""
     try:
         from huggingface_hub import hf_hub_download  # noqa: PLC0415
 
@@ -188,7 +189,7 @@ def _try_huggingface_downloads(
             "Please install huggingface_hub: pip install huggingface-hub",
         ) from e
 
-    if model_name:
+    if model_name is not None:
         if model_name not in source.filenames:
             raise ValueError(
                 f"Model {model_name} not found in available models: {source.filenames}",
@@ -244,29 +245,10 @@ def _try_huggingface_downloads(
 
         except (GatedRepoError, HfHubHTTPError) as e:
             # Check if this is an authentication/gating error
-            is_auth_error = False
             if isinstance(e, GatedRepoError) or (
                 isinstance(e, HfHubHTTPError) and e.response.status_code in (401, 403)
             ):
-                is_auth_error = True
-
-            if is_auth_error:
-                auth_message = (
-                    f"Authentication error downloading from '{source.repo_id}'.\n"
-                    "This model is gated and requires you to accept its terms.\n\n"
-                    "Please follow these steps:\n"
-                    f"1. Visit https://huggingface.co/{source.repo_id} in your "
-                    f"browser and"
-                    f" accept the terms of use.\n"
-                    "2. Log in to your Hugging Face account via"
-                    " the command line by running:\n"
-                    "   hf auth login\n"
-                    "(Alternatively, you can set the HF_TOKEN environment variable"
-                    " with a read token).\n\n"
-                    "For detailed instructions, see "
-                    "https://docs.priorlabs.ai/how-to-access-gated-models"
-                )
-                raise RuntimeError(auth_message)  # noqa: B904
+                raise TabPFNHuggingFaceGatedRepoError(source.repo_id)  # noqa: B904
             raise e
 
 
@@ -355,23 +337,36 @@ def download_model(
         _try_huggingface_downloads(to, model_source, model_name, suppress_warnings=True)
         return "ok"
     except Exception as e:  # noqa: BLE001
+        if isinstance(
+            e, TabPFNHuggingFaceGatedRepoError
+        ) and not _version_has_direct_download_option(version):
+            filename_for_logs = model_name or model_source.default_filename
+            # We wrap the HF error in the RuntimeError with a commercial message
+            # to make it easier for the user to see the instructions about
+            # authenticating with HuggingFace.
+            errors.append(
+                RuntimeError(
+                    f"Failed to download TabPFN {version} model '{filename_for_logs}'."
+                    f"\n\nDetails and instructions:\n{e!s}\n\n"
+                    f"For commercial usage, we provide alternative download options "
+                    f"for TabPFN {version}; please reach out to us at "
+                    "sales@priorlabs.ai."
+                )
+            )
+            return errors
+
         logger.warning("HuggingFace download failed.")
         errors.append(e)
 
     # For Version 2.5 we require gating, which we don't have in place for direct
     # downloads.
-    if version == ModelVersion.V2:
+    if _version_has_direct_download_option(version):
         try:
             _try_direct_downloads(to, model_source, model_name)
             return "ok"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Direct URL downloads failed: {e!s}")
             errors.append(e)
-    else:
-        logger.warning(
-            "For commercial usage, we provide alternative download options for v2.5, "
-            "please reach out to us at sales@priorlabs.ai."
-        )
 
     return errors
 
@@ -398,6 +393,11 @@ def download_all_models(to: Path) -> None:
                 which=cast("Literal['classifier', 'regressor']", model_type),
                 model_name=ckpt_name,
             )
+
+
+def _version_has_direct_download_option(version: ModelVersion) -> bool:
+    """Determine if a version has a direct download option."""
+    return version == ModelVersion.V2
 
 
 def get_cache_dir() -> Path:  # noqa: PLR0911
@@ -454,6 +454,39 @@ def get_cache_dir() -> Path:  # noqa: PLR0911
     return use_instead_path
 
 
+def _get_download_lock() -> FileLock:
+    lock_path = get_cache_dir() / ".download.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    return FileLock(lock_path, timeout=-1)
+
+
+_download_lock: FileLock = _get_download_lock()
+
+
+def _with_download_lock(func: Any) -> Any:
+    """Prevent race conditions when multiple threads/processes download the same
+    model simultaneously.
+
+    Without the lock, concurrent downloads could corrupt the model file or waste
+    bandwidth downloading the same file multiple times. The file lock ensures only
+    one download proceeds at a time while others wait.
+    """
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        lock_path = _download_lock.lock_file
+        logger.info(f"Acquiring download lock: {lock_path}")
+        _download_lock.acquire()
+        logger.debug(f"Acquired download lock: {lock_path}")
+        try:
+            return func(*args, **kwargs)
+        finally:
+            logger.debug(f"Releasing download lock: {lock_path}")
+            _download_lock.release()
+            logger.debug(f"Released download lock: {lock_path}")
+
+    return wrapper
+
+
 P = TypeVar("P", bound=Union[str, list[str]])
 
 
@@ -502,6 +535,7 @@ def load_model_criterion_config(
 ]: ...
 
 
+@_with_download_lock
 def load_model_criterion_config(
     model_path: ModelPath | list[ModelPath] | None,
     *,

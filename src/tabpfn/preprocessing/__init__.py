@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from .core import (
-    SequentialFeatureTransformer,
-    fit_preprocessing,
-    generate_classification_ensemble_configs,
-    generate_regression_ensemble_configs,
-)
-from .definitions import (
-    BaseDatasetConfig,
-    ClassifierDatasetConfig,
+from .configs import (
     ClassifierEnsembleConfig,
     EnsembleConfig,
     PreprocessorConfig,
-    RegressorDatasetConfig,
     RegressorEnsembleConfig,
+)
+from .ensemble import (
+    generate_classification_ensemble_configs,
+    generate_regression_ensemble_configs,
+)
+from .initialization import tag_features_and_sanitize_data
+from .pipeline_interfaces import (
+    SequentialFeatureTransformer,
 )
 from .presets import (
     default_classifier_preprocessor_configs,
@@ -23,14 +22,12 @@ from .presets import (
     v2_classifier_preprocessor_configs,
     v2_regressor_preprocessor_configs,
 )
+from .transform import fit_preprocessing
 
 __all__ = [
-    "BaseDatasetConfig",
-    "ClassifierDatasetConfig",
     "ClassifierEnsembleConfig",
     "EnsembleConfig",
     "PreprocessorConfig",
-    "RegressorDatasetConfig",
     "RegressorEnsembleConfig",
     "SequentialFeatureTransformer",
     "default_classifier_preprocessor_configs",
@@ -38,6 +35,7 @@ __all__ = [
     "fit_preprocessing",
     "generate_classification_ensemble_configs",
     "generate_regression_ensemble_configs",
+    "tag_features_and_sanitize_data",
     "v2_5_classifier_preprocessor_configs",
     "v2_5_regressor_preprocessor_configs",
     "v2_classifier_preprocessor_configs",

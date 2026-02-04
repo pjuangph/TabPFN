@@ -7,7 +7,8 @@ from typing_extensions import override
 import numpy as np
 import torch
 
-from tabpfn.preprocessing.steps.preprocessing_helpers import (
+from tabpfn.errors import TabPFNValidationError
+from tabpfn.preprocessing.pipeline_interfaces import (
     FeaturePreprocessingTransformerStep,
 )
 
@@ -29,7 +30,7 @@ class RemoveConstantFeaturesStep(FeaturePreprocessingTransformerStep):
             sel_ = ((X[0:1, :] == X).mean(axis=0) < 1.0).tolist()
 
         if not any(sel_):
-            raise ValueError(
+            raise TabPFNValidationError(
                 "All features are constant and would have been removed!"
                 " Unable to predict using TabPFN.",
             )

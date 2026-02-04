@@ -1,55 +1,170 @@
-"""Core preprocessing functionality for the TabPFN model.
-
-This module provides the core preprocessing pipeline and configuration generation
-for both classification and regression tasks and dataset preparation for the model.
-"""
+"""Module for generating ensemble configurations."""
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 from collections.abc import Iterable, Iterator, Sequence
-from functools import partial
 from itertools import chain, product, repeat
 from typing import TYPE_CHECKING, Literal, TypeVar
 
-import joblib
 import numpy as np
-import torch
 
 from tabpfn.constants import (
     CLASS_SHUFFLE_OVERESTIMATE_FACTOR,
     MAXIMUM_FEATURE_SHIFT,
-    PARALLEL_MODE_TO_RETURN_AS,
-    SUPPORTS_RETURN_AS,
 )
-from tabpfn.preprocessing.steps import (
-    AddFingerprintFeaturesStep,
-    DifferentiableZNormStep,
-    EncodeCategoricalFeaturesStep,
-    FeaturePreprocessingTransformerStep,
-    NanHandlingPolynomialFeaturesStep,
-    RemoveConstantFeaturesStep,
-    ReshapeFeatureDistributionsStep,
-    SequentialFeatureTransformer,
-    ShuffleFeaturesStep,
-)
-from tabpfn.utils import infer_random_state
-
-from .definitions import (
+from tabpfn.preprocessing.configs import (
     ClassifierEnsembleConfig,
     EnsembleConfig,
-    PreprocessorConfig,
     RegressorEnsembleConfig,
 )
+from tabpfn.preprocessing.torch import (
+    TorchPreprocessingPipeline,
+    create_gpu_preprocessing_pipeline,
+)
+from tabpfn.preprocessing.transform import fit_preprocessing
+from tabpfn.utils import infer_random_state
 
 if TYPE_CHECKING:
     import numpy.typing as npt
+    import torch
     from sklearn.base import TransformerMixin
     from sklearn.pipeline import Pipeline
 
+    from tabpfn.preprocessing.configs import PreprocessorConfig
+    from tabpfn.preprocessing.pipeline_interfaces import SequentialFeatureTransformer
+
 T = TypeVar("T")
 
-# --- helpers ---
+
+@dataclasses.dataclass
+class TabPFNPreprocessedEnsembleMember:
+    """Holds preprocessed data, config, preprocessors for a single ensemble member.
+
+    The data is preprocessed on the CPU but this member also holds a torch preprocessor
+    pipeline to be run before inference on the GPU.
+    """
+
+    config: EnsembleConfig
+    cpu_preprocessor: SequentialFeatureTransformer
+    gpu_preprocessor: TorchPreprocessingPipeline | None
+    X_train: np.ndarray | torch.Tensor
+    y_train: np.ndarray | torch.Tensor
+    cat_ix: list[int]
+
+    def transform_X_test(
+        self, X: np.ndarray | torch.Tensor
+    ) -> np.ndarray | torch.Tensor:
+        """Transform the test data."""
+        return self.cpu_preprocessor.transform(X).X
+
+
+class TabPFNEnsemblePreprocessor:
+    """Generates pipelines and preprocesses the ensemble members.
+
+    This class has two main functionalities:
+    1. Can parallelize the preprocessing of multiple ensemble members
+    2. Can use global data information and pipelines to perform balanced data slicing
+       (e.g. sample/feature subsampling) per ensemble member.
+    """
+
+    def __init__(
+        self,
+        *,
+        configs: list[ClassifierEnsembleConfig] | list[RegressorEnsembleConfig],
+        rng: np.random.Generator,
+        n_preprocessing_jobs: int,
+        keep_fitted_cache: bool = False,
+    ) -> None:
+        """Init.
+
+        Args:
+            configs: List of ensemble configurations.
+            rng: Random number generator.
+            n_preprocessing_jobs: Number of preprocessing jobs to use.
+            keep_fitted_cache: Whether to keep the fitted cache for gpu preprocessing.
+                For the cpu preprocessors, the cache is always kept implicitly in the
+                preprocessor objects.
+        """
+        super().__init__()
+        self.configs = configs
+        self.rng = rng
+        self.n_preprocessing_jobs = n_preprocessing_jobs
+        self.keep_fitted_cache = keep_fitted_cache
+
+        # TODO:
+        # 1. Create pipeline in init for balanced feature subsampling
+        # 2. Run pipeline.num_added_features() for each ensemble member
+        # 3. Create feature slices
+
+    def next_static_seed(self) -> int:
+        """Get a static seed for the ensemble data processor.
+
+        This can be used to redo the preprocessing with the same random state
+        during the fit_transform*() methods. Currently it is only used
+        in the InferenceEngineOnDemand class.
+        """
+        return self.rng.integers(0, int(np.iinfo(np.int32).max))
+
+    def fit_transform_ensemble_members_iterator(
+        self,
+        X_train: np.ndarray | torch.Tensor,
+        y_train: np.ndarray | torch.Tensor,
+        cat_ix: list[int],
+        parallel_mode: Literal["block", "as-ready", "in-order"],
+        override_random_state: int | np.random.Generator | None = None,
+    ) -> Iterator[TabPFNPreprocessedEnsembleMember]:
+        """Get an iterator over the fit and transform data."""
+        preprocessed_data_iterator = fit_preprocessing(
+            configs=self.configs,
+            X_train=X_train,
+            y_train=y_train,
+            cat_ix=cat_ix,
+            random_state=override_random_state or self.rng,
+            n_preprocessing_jobs=self.n_preprocessing_jobs,
+            parallel_mode=parallel_mode,
+        )
+
+        gpu_preprocessors = []
+        for config in self.configs:
+            gpu_preprocessor = create_gpu_preprocessing_pipeline(
+                config=config,
+                keep_fitted_cache=self.keep_fitted_cache,
+            )
+            gpu_preprocessors.append(gpu_preprocessor)
+
+        for i, (
+            config,
+            cpu_preprocessor,
+            X_train_preprocessed,
+            y_train_preprocessed,
+            cat_ix_preprocessed,
+        ) in enumerate(preprocessed_data_iterator):
+            yield TabPFNPreprocessedEnsembleMember(
+                config=config,
+                cpu_preprocessor=cpu_preprocessor,
+                gpu_preprocessor=gpu_preprocessors[i],
+                X_train=X_train_preprocessed,
+                y_train=y_train_preprocessed,
+                cat_ix=cat_ix_preprocessed,
+            )
+
+    def fit_transform_ensemble_members(
+        self,
+        X_train: np.ndarray | torch.Tensor,
+        y_train: np.ndarray | torch.Tensor,
+        cat_ix: list[int],
+    ) -> list[TabPFNPreprocessedEnsembleMember]:
+        """Fit and transform the ensemble members."""
+        return list(
+            self.fit_transform_ensemble_members_iterator(
+                X_train=X_train,
+                y_train=y_train,
+                cat_ix=cat_ix,
+                parallel_mode="block",
+            )
+        )
 
 
 def _balance(x: Iterable[T], n: int) -> list[T]:
@@ -58,9 +173,6 @@ def _balance(x: Iterable[T], n: int) -> list[T]:
     E.g. balance([1, 2, 3], 2) -> [1, 1, 2, 2, 3, 3]
     """
     return list(chain.from_iterable(repeat(elem, n) for elem in x))
-
-
-# --- sampling ---
 
 
 def _generate_index_permutations(
@@ -158,9 +270,6 @@ def _get_subsample_indices_for_estimators(
     return subsample_indices
 
 
-# --- ensemble config generation ---
-
-
 def _generate_class_permutations(
     *,
     num_estimators: int,
@@ -231,6 +340,7 @@ def generate_classification_ensemble_configs(  # noqa: PLR0913
     n_classes: int,
     random_state: int | np.random.Generator | None,
     num_models: int,
+    outlier_removal_std: float | None,
 ) -> list[ClassifierEnsembleConfig]:
     """Generate ensemble configurations for classification.
 
@@ -249,6 +359,7 @@ def generate_classification_ensemble_configs(  # noqa: PLR0913
         n_classes: Number of classes.
         random_state: Random number generator.
         num_models: Number of models to use.
+        outlier_removal_std: The standard deviation to remove outliers.
 
     Returns:
         List of ensemble configurations.
@@ -292,6 +403,7 @@ def generate_classification_ensemble_configs(  # noqa: PLR0913
             feature_shift_decoder=feature_shift_decoder,
             subsample_ix=subsample_ix,
             _model_index=model_index,
+            outlier_removal_std=outlier_removal_std,
         )
         for (
             featshift,
@@ -309,7 +421,7 @@ def generate_classification_ensemble_configs(  # noqa: PLR0913
     ]
 
 
-def generate_regression_ensemble_configs(
+def generate_regression_ensemble_configs(  # noqa: PLR0913
     *,
     num_estimators: int,
     subsample_samples: int | float | list[np.ndarray] | None,
@@ -321,6 +433,7 @@ def generate_regression_ensemble_configs(
     target_transforms: Sequence[TransformerMixin | Pipeline | None],
     random_state: int | np.random.Generator | None,
     num_models: int,
+    outlier_removal_std: float | None,
 ) -> list[RegressorEnsembleConfig]:
     """Generate ensemble configurations for regression.
 
@@ -338,6 +451,7 @@ def generate_regression_ensemble_configs(
         target_transforms: Target transformations to apply.
         random_state: Random number generator.
         num_models: Number of models to use.
+        outlier_removal_std: The standard deviation to remove outliers.
 
     Returns:
         List of ensemble configurations.
@@ -374,6 +488,7 @@ def generate_regression_ensemble_configs(
             feature_shift_decoder=feature_shift_decoder,
             subsample_ix=subsample_ix,
             target_transform=target_transform,
+            outlier_removal_std=outlier_removal_std,
             _model_index=model_index,
         )
         for featshift, subsample_ix, (
@@ -386,221 +501,3 @@ def generate_regression_ensemble_configs(
             model_indices,
         )
     ]
-
-
-# --- pipeline construction ---
-
-
-def _polynomial_feature_settings(
-    polynomial_features: Literal["no", "all"] | int,
-) -> tuple[bool, int | None]:
-    if isinstance(polynomial_features, int):
-        assert polynomial_features > 0, "Poly. features to add must be >0!"
-        return True, polynomial_features
-    if polynomial_features == "all":
-        return True, None
-    if polynomial_features == "no":
-        return False, None
-    raise ValueError(f"Invalid polynomial_features value: {polynomial_features}")
-
-
-def build_pipeline(
-    config: EnsembleConfig,
-    *,
-    random_state: int | np.random.Generator | None,
-) -> SequentialFeatureTransformer:
-    """Convert the ensemble configuration to a preprocessing pipeline."""
-    steps: list[FeaturePreprocessingTransformerStep] = []
-
-    use_poly_features, max_poly_features = _polynomial_feature_settings(
-        config.polynomial_features
-    )
-    if use_poly_features:
-        steps.append(
-            NanHandlingPolynomialFeaturesStep(
-                max_features=max_poly_features,
-                random_state=random_state,
-            ),
-        )
-
-    steps.append(RemoveConstantFeaturesStep())
-
-    if config.preprocess_config.differentiable:
-        steps.append(DifferentiableZNormStep())
-    else:
-        steps.extend(
-            [
-                ReshapeFeatureDistributionsStep(
-                    transform_name=config.preprocess_config.name,
-                    append_to_original=config.preprocess_config.append_original,
-                    max_features_per_estimator=config.preprocess_config.max_features_per_estimator,
-                    global_transformer_name=config.preprocess_config.global_transformer_name,
-                    apply_to_categorical=(
-                        config.preprocess_config.categorical_name == "numeric"
-                    ),
-                    random_state=random_state,
-                ),
-                EncodeCategoricalFeaturesStep(
-                    config.preprocess_config.categorical_name,
-                    random_state=random_state,
-                ),
-            ],
-        )
-
-    if config.add_fingerprint_feature:
-        steps.append(AddFingerprintFeaturesStep(random_state=random_state))
-
-    steps.append(
-        ShuffleFeaturesStep(
-            shuffle_method=config.feature_shift_decoder,
-            shuffle_index=config.feature_shift_count,
-            random_state=random_state,
-        ),
-    )
-    return SequentialFeatureTransformer(steps)
-
-
-# --- fitting/orchestration ---
-
-
-def _fit_preprocessing_one(
-    config: EnsembleConfig,
-    X_train: np.ndarray | torch.Tensor,
-    y_train: np.ndarray | torch.Tensor,
-    random_state: int | np.random.Generator | None = None,
-    *,
-    cat_ix: list[int],
-) -> tuple[
-    EnsembleConfig,
-    SequentialFeatureTransformer,
-    np.ndarray,
-    np.ndarray,
-    list[int],
-]:
-    """Fit preprocessing pipeline for a single ensemble configuration.
-
-    Args:
-        config: Ensemble configuration.
-        X_train: Training data.
-        y_train: Training target.
-        random_state: Random seed.
-        cat_ix: Indices of categorical features.
-        process_idx: Which indices to consider. Only return values for these indices.
-            if None, all indices are processed, which is the default.
-
-    Returns:
-        Tuple containing the ensemble configuration, the fitted preprocessing pipeline,
-        the transformed training data, the transformed target, and the indices of
-        categorical features.
-    """
-    static_seed, _ = infer_random_state(random_state)
-    if config.subsample_ix is not None:
-        X_train = X_train[config.subsample_ix]
-        y_train = y_train[config.subsample_ix]
-    if not isinstance(X_train, torch.Tensor):
-        X_train = X_train.copy()
-        y_train = y_train.copy()
-
-    preprocessor = build_pipeline(config, random_state=static_seed)
-    res = preprocessor.fit_transform(X_train, cat_ix)
-
-    y_train_processed = _transform_labels_one(config, y_train)
-
-    return (config, preprocessor, res.X, y_train_processed, res.categorical_features)
-
-
-def _transform_labels_one(
-    config: EnsembleConfig, y_train: np.ndarray | torch.Tensor
-) -> np.ndarray:
-    """Transform the labels for one ensemble config.
-        for both regression or classification.
-
-    Args:
-        config: Ensemble config.
-        y_train: The unprocessed labels.
-
-    Return: The processed labels.
-    """
-    if isinstance(config, RegressorEnsembleConfig):
-        if config.target_transform is not None:
-            y_train = config.target_transform.fit_transform(
-                y_train.reshape(-1, 1),
-            ).ravel()
-    elif isinstance(config, ClassifierEnsembleConfig):
-        if config.class_permutation is not None:
-            y_train = config.class_permutation[y_train]
-    else:
-        raise ValueError(f"Invalid ensemble config type: {type(config)}")
-    return y_train
-
-
-def fit_preprocessing(
-    configs: Sequence[EnsembleConfig],
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    *,
-    random_state: int | np.random.Generator | None,
-    cat_ix: list[int],
-    n_preprocessing_jobs: int,
-    parallel_mode: Literal["block", "as-ready", "in-order"],
-) -> Iterator[
-    tuple[
-        EnsembleConfig,
-        SequentialFeatureTransformer,
-        np.ndarray,
-        np.ndarray,
-        list[int],
-    ]
-]:
-    """Fit preprocessing pipelines in parallel.
-
-    Args:
-        configs: List of ensemble configurations.
-        X_train: Training data.
-        y_train: Training target.
-        random_state: Random number generator.
-        cat_ix: Indices of categorical features.
-        n_preprocessing_jobs: Number of worker processes to use.
-            If `1`, then the preprocessing is performed in the current process. This
-                avoids multiprocessing overheads, but may not be able to full saturate
-                the CPU. Note that the preprocessing itself will parallelise over
-                multiple cores, so one job is often enough.
-            If `>1`, then different estimators are dispatched to different proceses,
-                which allows more parallelism but incurs some overhead.
-            If `-1`, then creates as many workers as CPU cores. As each worker itself
-                uses multiple cores, this is likely too many.
-            It is best to select this value by benchmarking.
-        parallel_mode:
-            Parallel mode to use.
-
-            * `"block"`: Blocks until all workers are done. Returns in order.
-            * `"as-ready"`: Returns results as they are ready. Any order.
-            * `"in-order"`: Returns results in order, blocking only in the order that
-                needs to be returned in.
-
-    Returns:
-        Iterator of tuples containing the ensemble configuration, the fitted
-        preprocessing pipeline, the transformed training data, the transformed target,
-        and the indices of categorical features.
-    """
-    _, rng = infer_random_state(random_state)
-
-    if SUPPORTS_RETURN_AS:
-        return_as = PARALLEL_MODE_TO_RETURN_AS[parallel_mode]
-        executor = joblib.Parallel(
-            n_jobs=n_preprocessing_jobs,
-            return_as=return_as,
-            batch_size="auto",
-        )
-    else:
-        executor = joblib.Parallel(n_jobs=n_preprocessing_jobs, batch_size="auto")
-    func = partial(_fit_preprocessing_one, cat_ix=cat_ix)
-    worker_func = joblib.delayed(func)
-
-    seeds = rng.integers(0, np.iinfo(np.int32).max, len(configs))
-    yield from executor(  # type: ignore[misc]
-        [
-            worker_func(config, X_train, y_train, seed)
-            for config, seed in zip(configs, seeds)
-        ],
-    )
