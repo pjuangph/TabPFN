@@ -59,31 +59,8 @@ def main() -> None:
     X_all = data.data
     y_all = data.target
 
-    # --- Setup Data, Model, and Dataloader ---
-    X_train, X_test, y_train, y_test = prepare_data(config)
-    regressor, regressor_config = setup_regressor(config)
-
-    # TabPFN lazily initializes the internal torch model; do it explicitly since we
-    # access `models_` for fine-tuning.
-    regressor._initialize_model_variables()
-
-    if len(regressor.models_) > 1:
-        raise ValueError(
-            f"Your TabPFNRegressor uses multiple models ({len(regressor.models_)}). "
-            "Finetuning is not supported for multiple models. Please use a single model."
-        )
-
-    model = regressor.models_[0]
-
-    splitter = partial(train_test_split, test_size=config["valid_set_ratio"])
-    # Note: `max_data_size` corresponds to the finetuning `batch_size` in the config
-    training_datasets = regressor.get_preprocessed_datasets(
-        X_train, y_train, splitter, max_data_size=config["finetuning"]["batch_size"]
-    )
-    finetuning_dataloader = DataLoader(
-        training_datasets,
-        batch_size=config["finetuning"]["meta_batch_size"],
-        collate_fn=meta_dataset_collator,
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_all, y_all, test_size=0.1, random_state=RANDOM_STATE
     )
 
     print(
@@ -104,12 +81,8 @@ def main() -> None:
     mse = mean_squared_error(y_test, base_pred)
     r2 = r2_score(y_test, base_pred)
 
-    regressor.raw_space_bardist_ = raw_space_bardist_[0]
-    regressor.znorm_space_bardist_ = znorm_space_bardist_[0]
-    regressor.fit_from_preprocessed(
-        X_trains_preprocessed, y_trains_znorm, cat_ixs, confs
-    )
-    logits, _, _ = regressor.forward(X_tests_preprocessed)
+    print(f"📊 Default TabPFN Test MSE: {mse:.4f}")
+    print(f"📊 Default TabPFN Test R²: {r2:.4f}\n")
 
     # 3. Initialize and run fine-tuning
     print("--- 2. Initializing and Fitting Model ---\n")
