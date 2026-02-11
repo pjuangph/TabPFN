@@ -17,14 +17,15 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from tabpfn.architectures.base.encoders import (
-    LinearInputEncoderStep,
-    NanHandlingEncoderStep,
-    SequentialEncoder,
-)
 from tabpfn.architectures.base.layer import PerFeatureEncoderLayer
 from tabpfn.architectures.base.thinking_tokens import AddThinkingTokens
+from tabpfn.architectures.encoders import (
+    LinearInputEncoderStep,
+    NanHandlingEncoderStep,
+    TorchPreprocessingPipeline,
+)
 from tabpfn.architectures.interface import Architecture
+from tabpfn.errors import TabPFNValidationError
 
 if TYPE_CHECKING:
     from tabpfn.architectures.base.config import ModelConfig
@@ -154,29 +155,39 @@ class PerFeatureTransformer(Architecture):
         super().__init__()
 
         if encoder is None:
-            encoder = SequentialEncoder(
-                LinearInputEncoderStep(
-                    num_features=1,
-                    emsize=config.emsize,
-                    replace_nan_by_zero=False,
-                    bias=True,
-                    in_keys=("main",),
-                    out_keys=("output",),
-                ),
+            encoder = TorchPreprocessingPipeline(
+                steps=[
+                    LinearInputEncoderStep(
+                        num_features=1,
+                        emsize=config.emsize,
+                        replace_nan_by_zero=False,
+                        bias=True,
+                        in_keys=("main",),
+                        out_keys=("output",),
+                    )
+                ],
+                output_key="output",
             )
 
         if y_encoder is None:
-            y_encoder = SequentialEncoder(
-                NanHandlingEncoderStep(),
-                LinearInputEncoderStep(
-                    num_features=2,
-                    emsize=config.emsize,
-                    replace_nan_by_zero=False,
-                    bias=True,
-                    out_keys=("output",),
-                    in_keys=("main", "nan_indicators"),
-                ),
+            y_encoder = TorchPreprocessingPipeline(
+                steps=[
+                    NanHandlingEncoderStep(
+                        in_keys=("main",),
+                        out_keys=("main", "nan_indicators"),
+                    ),
+                    LinearInputEncoderStep(
+                        num_features=2,
+                        emsize=config.emsize,
+                        replace_nan_by_zero=False,
+                        bias=True,
+                        out_keys=("output",),
+                        in_keys=("main", "nan_indicators"),
+                    ),
+                ],
+                output_key="output",
             )
+
         self.encoder = encoder
         self.y_encoder = y_encoder
         self.ninp = config.emsize
@@ -464,7 +475,7 @@ class PerFeatureTransformer(Architecture):
         extra_encoders_args = {}
         if categorical_inds_to_use is not None and isinstance(
             self.encoder,
-            SequentialEncoder,
+            TorchPreprocessingPipeline,
         ):
             # Transform cat. features accordingly to correspond to following to merge
             # of batch and feature_group dimensions below (i.e., concat lists)
@@ -472,6 +483,7 @@ class PerFeatureTransformer(Architecture):
 
         for k in x:
             x[k] = einops.rearrange(x[k], "b s f n -> s (b f) n")
+
         embedded_x = einops.rearrange(
             self.encoder(
                 x,
@@ -503,7 +515,7 @@ class PerFeatureTransformer(Architecture):
         embedded_input = torch.cat((embedded_x, embedded_y.unsqueeze(2)), dim=2)
 
         if torch.isnan(embedded_input).any():
-            raise ValueError(
+            raise TabPFNValidationError(
                 f"There should be no NaNs in the encoded x and y."
                 "Check that you do not feed NaNs or use a NaN-handling enocder."
                 "Your embedded x and y returned the following:"

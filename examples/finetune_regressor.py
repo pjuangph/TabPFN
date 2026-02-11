@@ -1,145 +1,63 @@
-"""Provides a detailed example of fine-tuning a TabPFNRegressor model.
-
-This script demonstrates the complete workflow, including data loading and preparation
-for the Bike Sharing Demand dataset, model configuration, the fine-tuning loop,
-and performance evaluation for a regression task.
+"""Example of fine-tuning a TabPFN regressor using the FinetunedTabPFNRegressor wrapper.
 
 Note: We recommend running the fine-tuning scripts on a CUDA-enabled GPU, as full
 support for the Apple Silicon (MPS) backend is still under development.
 """
 
-from functools import partial
+import logging
+import warnings
 
-import numpy as np
 import sklearn.datasets
 import torch
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
-from torch.optim import Adam
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from tabpfn import TabPFNRegressor
-from tabpfn.finetune_utils import clone_model_for_evaluation
-from tabpfn.utils import meta_dataset_collator
+from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
 
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"google\.api_core\._python_version_support",
+)
 
-def prepare_data(config: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Loads, subsets, and splits the California Housing dataset."""
-    print("--- 1. Data Preparation ---")
-    # Fetch Ames housing data from OpenML
-    bike_sharing = sklearn.datasets.fetch_openml(
-        name="Bike_Sharing_Demand", version=2, as_frame=True, parser="auto"
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
-    # Separate features (X) and target (y)
-    X_df = bike_sharing.data
-    y_df = bike_sharing.target
+# =============================================================================
+# Fine-tuning Configuration
+# For details and more options see FinetunedTabPFNRegressor
+#
+# These settings work well for the California Housing dataset.
+# For other datasets, you may need to adjust these settings to get good results.
+# =============================================================================
 
-    # Select only numeric features for simplicity
-    X_numeric = X_df.select_dtypes(include=np.number)
+# Training hyperparameters
+NUM_EPOCHS = 30
+LEARNING_RATE = 1e-5
 
-    X_all, y_all = X_numeric.values, y_df.values
+# We can fine-tune using almost the entire housing dataset
+# in the context of the train batches.
+N_FINETUNE_CTX_PLUS_QUERY_SAMPLES = 20_000
 
-    rng = np.random.default_rng(config["random_seed"])
-    num_samples_to_use = min(config["num_samples_to_use"], len(y_all))
-    indices = rng.choice(np.arange(len(y_all)), size=num_samples_to_use, replace=False)
-    X, y = X_all[indices], y_all[indices]
+# Ensemble configuration
+# number of estimators to use during finetuning
+NUM_ESTIMATORS_FINETUNE = 8
+# number of estimators to use during train time validation
+NUM_ESTIMATORS_VALIDATION = 8
+# number of estimators to use during final inference
+NUM_ESTIMATORS_FINAL_INFERENCE = 8
 
-    splitter = partial(
-        train_test_split,
-        test_size=config["valid_set_ratio"],
-        random_state=config["random_seed"],
-    )
-    X_train, X_test, y_train, y_test = splitter(X, y)
-
-    print(
-        f"Loaded and split data: {X_train.shape[0]} train, {X_test.shape[0]} test samples."
-    )
-    print("---------------------------\n")
-    return X_train, X_test, y_train, y_test
-
-
-def setup_regressor(config: dict) -> tuple[TabPFNRegressor, dict]:
-    """Initializes the TabPFN regressor and its configuration."""
-    print("--- 2. Model Setup ---")
-    regressor_config = {
-        "ignore_pretraining_limits": True,
-        "device": config["device"],
-        "n_estimators": 2,
-        "random_state": config["random_seed"],
-        "inference_precision": torch.float32,
-    }
-    regressor = TabPFNRegressor(
-        **regressor_config, fit_mode="batched", differentiable_input=False
-    )
-
-    print(f"Using device: {config['device']}")
-    print("----------------------\n")
-    return regressor, regressor_config
-
-
-def evaluate_regressor(
-    regressor: TabPFNRegressor,
-    eval_config: dict,
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-) -> tuple[float, float, float]:
-    """Evaluates the regressor's performance on the test set."""
-    eval_regressor = clone_model_for_evaluation(regressor, eval_config, TabPFNRegressor)
-    eval_regressor.fit(X_train, y_train)
-
-    try:
-        predictions = eval_regressor.predict(X_test)
-        mse = mean_squared_error(y_test, predictions)
-        mae = mean_absolute_error(y_test, predictions)
-        r2 = r2_score(y_test, predictions)
-    except Exception as e:
-        print(f"An error occurred during evaluation: {e}")
-        mse, mae, r2 = np.nan, np.nan, np.nan
-
-    return mse, mae, r2
+# Reproducibility
+RANDOM_STATE = 0
 
 
 def main() -> None:
-    """Main function to configure and run the finetuning workflow."""
-    # --- Master Configuration ---
-    # This improved structure separates general settings from finetuning hyperparameters.
-    config = {
-        # Sets the computation device ('cuda' for GPU if available, otherwise 'cpu').
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        # The total number of samples to draw from the full dataset. This is useful for
-        # managing memory and computation time, especially with large datasets.
-        # For very large datasets the entire dataset is preprocessed and then
-        # fit in memory, potentially leading to OOM errors.
-        "num_samples_to_use": 100_000,
-        # A seed for random number generators to ensure that data shuffling, splitting,
-        # and model initializations are reproducible.
-        "random_seed": 42,
-        # The proportion of the dataset to allocate to the valid set for final evaluation.
-        "valid_set_ratio": 0.3,
-        # During evaluation, this is the number of samples from the training set given to the
-        # model as context before it makes predictions on the test set.
-        "n_inference_context_samples": 10000,
-    }
-    config["finetuning"] = {
-        # The total number of passes through the entire fine-tuning dataset.
-        "epochs": 10,
-        # A small learning rate is crucial for fine-tuning to avoid catastrophic forgetting.
-        "learning_rate": 1.5e-6,
-        # Meta Batch size for finetuning, i.e. how many datasets per batch. Must be 1 currently.
-        "meta_batch_size": 1,
-        # The number of samples within each training data split. It's capped by
-        # n_inference_context_samples to align with the evaluation setup.
-        "batch_size": int(
-            min(
-                config["n_inference_context_samples"],
-                config["num_samples_to_use"] * (1 - config["valid_set_ratio"]),
-            )
-        ),
-    }
+    data = sklearn.datasets.fetch_california_housing(as_frame=True)
+    X_all = data.data
+    y_all = data.target
 
     # --- Setup Data, Model, and Dataloader ---
     X_train, X_test, y_train, y_test = prepare_data(config)
@@ -168,71 +86,64 @@ def main() -> None:
         collate_fn=meta_dataset_collator,
     )
 
-    # Optimizer must be created AFTER get_preprocessed_datasets, which initializes the model
-    optimizer = Adam(model.parameters(), lr=config["finetuning"]["learning_rate"])
     print(
-        f"--- Optimizer Initialized: Adam, LR: {config['finetuning']['learning_rate']} ---\n"
+        f"Loaded {len(X_train):,} samples for training and "
+        f"{len(X_test):,} samples for testing."
     )
 
-    # Create evaluation config, linking it to the master config
-    eval_config = {
-        **regressor_config,
-        "inference_config": {
-            "SUBSAMPLE_SAMPLES": config["n_inference_context_samples"]
-        },
-    }
+    # 2. Initial model evaluation on test set
+    base_reg = TabPFNRegressor(
+        device=[f"cuda:{i}" for i in range(torch.cuda.device_count())],
+        n_estimators=NUM_ESTIMATORS_FINAL_INFERENCE,
+        ignore_pretraining_limits=True,
+        inference_config={"SUBSAMPLE_SAMPLES": 50_000},
+    )
+    base_reg.fit(X_train, y_train)
 
-    # --- Finetuning and Evaluation Loop ---
-    print("--- 3. Starting Finetuning & Evaluation ---")
-    for epoch in range(config["finetuning"]["epochs"] + 1):
-        if epoch > 0:
-            # Create a tqdm progress bar to iterate over the dataloader
-            progress_bar = tqdm(finetuning_dataloader, desc=f"Finetuning Epoch {epoch}")
-            for data_batch in progress_bar:
-                optimizer.zero_grad()
-                (
-                    X_trains_preprocessed,
-                    X_tests_preprocessed,
-                    y_trains_znorm,
-                    y_test_znorm,
-                    cat_ixs,
-                    confs,
-                    raw_space_bardist_,
-                    znorm_space_bardist_,
-                    _,
-                    _y_test_raw,
-                ) = data_batch
+    base_pred = base_reg.predict(X_test)
+    mse = mean_squared_error(y_test, base_pred)
+    r2 = r2_score(y_test, base_pred)
 
-                regressor.raw_space_bardist_ = raw_space_bardist_[0]
-                regressor.znorm_space_bardist_ = znorm_space_bardist_[0]
-                regressor.fit_from_preprocessed(
-                    X_trains_preprocessed, y_trains_znorm, cat_ixs, confs
-                )
-                logits, _, _ = regressor.forward(X_tests_preprocessed)
+    regressor.raw_space_bardist_ = raw_space_bardist_[0]
+    regressor.znorm_space_bardist_ = znorm_space_bardist_[0]
+    regressor.fit_from_preprocessed(
+        X_trains_preprocessed, y_trains_znorm, cat_ixs, confs
+    )
+    logits, _, _ = regressor.forward(X_tests_preprocessed)
 
-                # For regression, the loss function is part of the preprocessed data
-                loss_fn = znorm_space_bardist_[0]
-                y_target = y_test_znorm
+    # 3. Initialize and run fine-tuning
+    print("--- 2. Initializing and Fitting Model ---\n")
 
-                loss = loss_fn(logits, y_target.to(config["device"])).mean()
-                loss.backward()
-                optimizer.step()
+    # Instantiate the wrapper with your desired hyperparameters
+    finetuned_reg = FinetunedTabPFNRegressor(
+        device="cuda",
+        epochs=NUM_EPOCHS,
+        learning_rate=LEARNING_RATE,
+        random_state=RANDOM_STATE,
+        n_finetune_ctx_plus_query_samples=N_FINETUNE_CTX_PLUS_QUERY_SAMPLES,
+        n_estimators_finetune=NUM_ESTIMATORS_FINETUNE,
+        n_estimators_validation=NUM_ESTIMATORS_VALIDATION,
+        n_estimators_final_inference=NUM_ESTIMATORS_FINAL_INFERENCE,
+    )
 
-                # Set the postfix of the progress bar to show the current loss
-                progress_bar.set_postfix(loss=f"{loss.item():.4f}")
+    # 4. Call .fit() to start the fine-tuning process on the training data
+    finetuned_reg.fit(X_train.values, y_train.values)
+    print("\n")
 
-        # Evaluation Step (runs before finetuning and after each epoch)
-        mse, mae, r2 = evaluate_regressor(
-            regressor, eval_config, X_train, y_train, X_test, y_test
-        )
+    # 5. Evaluate the fine-tuned model
+    print("--- 3. Evaluating Model on Held-out Test Set ---\n")
+    y_pred = finetuned_reg.predict(X_test.values)
 
-        status = "Initial" if epoch == 0 else f"Epoch {epoch}"
-        print(
-            f"📊 {status} Evaluation | Test MSE: {mse:.4f}, Test MAE: {mae:.4f}, Test R2: {r2:.4f}\n"
-        )
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
 
-    print("--- ✅ Finetuning Finished ---")
+    print(f"📊 Finetuned TabPFN Test MSE: {mse:.4f}")
+    print(f"📊 Finetuned TabPFN Test R²: {r2:.4f}")
 
 
 if __name__ == "__main__":
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available. Please run the script on a CUDA-enabled GPU."
+        )
     main()

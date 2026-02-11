@@ -16,7 +16,9 @@ from tabpfn.preprocessing import (
     ClassifierEnsembleConfig,
     EnsembleConfig,
     PreprocessorConfig,
+    generate_classification_ensemble_configs,
 )
+from tabpfn.preprocessing.ensemble import TabPFNEnsemblePreprocessor
 
 
 class TestModel(Architecture):
@@ -89,22 +91,25 @@ def test__cache_preprocessing__result_equal_in_serial_and_in_parallel() -> None:
     y_train = rng.integers(low=0, high=n_classes - 1, size=(n_train, 1))
     X_test = rng.standard_normal(size=(2, n_features))
 
-    engine = InferenceEngineCachePreprocessing.prepare(
-        X_train,
-        y_train,
-        cat_ix=[] * n_train,
-        models=[TestModel()],
-        devices=[torch.device("cpu")],
-        ensemble_configs=_create_test_ensemble_configs(
+    ensemble_preprocessor = TabPFNEnsemblePreprocessor(
+        configs=_create_test_ensemble_configs(
             n_configs=5,
-            n_classes=n_classes,
+            n_classes=3,
             num_models=1,
         ),
+        rng=rng,
         # We want to test n_preprocessing_jobs>1 as this might mean the outputs are not
         # in the same order as the input configs, and we want to check that the parallel
         # evaluation code behaves correctly in this scenario.
         n_preprocessing_jobs=5,
-        rng=rng,
+    )
+    engine = InferenceEngineCachePreprocessing(
+        X_train,
+        y_train,
+        cat_ix=[] * n_train,
+        ensemble_preprocessor=ensemble_preprocessor,
+        models=[TestModel()],
+        devices=[torch.device("cpu")],
         dtype_byte_size=4,
         force_inference_dtype=None,
         save_peak_mem=True,
@@ -128,6 +133,59 @@ def test__cache_preprocessing__result_equal_in_serial_and_in_parallel() -> None:
         assert torch.allclose(seq_output, par_output)
 
 
+def test__cache_preprocessing__with_outlier_removal() -> None:
+    def get_outputs(
+        outlier_removal_std: float | None = None,
+    ) -> list[tuple[torch.Tensor | dict, EnsembleConfig]]:
+        rng = default_rng(seed=0)
+        n_train = 50
+        n_features = 4
+        n_classes = 3
+        X_train = rng.standard_normal(size=(n_train, n_features))
+        X_train[0:10] = 500  # outliers
+        y_train = rng.integers(low=0, high=n_classes - 1, size=(n_train, 1))
+        X_test = rng.standard_normal(size=(2, n_features))
+
+        num_models = 1
+        models = [TestModel() for _ in range(num_models)]
+        ensemble_preprocessor = TabPFNEnsemblePreprocessor(
+            configs=_create_test_ensemble_configs(
+                n_configs=5,
+                n_classes=3,
+                num_models=num_models,
+                outlier_removal_std=outlier_removal_std,
+            ),
+            rng=rng,
+            n_preprocessing_jobs=1,
+        )
+        engine = InferenceEngineOnDemand(
+            X_train,
+            y_train,
+            cat_ix=[] * n_train,
+            ensemble_preprocessor=ensemble_preprocessor,
+            models=models,
+            devices=[torch.device("cpu")],
+            dtype_byte_size=4,
+            force_inference_dtype=None,
+            save_peak_mem=True,
+        )
+        engine.to([torch.device("cpu")], force_inference_dtype=None, dtype_byte_size=4)
+        return list(engine.iter_outputs(X_test, autocast=False))
+
+    outputs_outlier_removed = get_outputs(outlier_removal_std=1.0)
+    outputs_outlier_not_removed = get_outputs(outlier_removal_std=None)
+
+    assert len(outputs_outlier_removed) == len(outputs_outlier_not_removed)
+    for outlier_removed_output, outlier_not_removed_output in zip(
+        outputs_outlier_removed, outputs_outlier_not_removed
+    ):
+        assert isinstance(outlier_removed_output[0], Tensor)
+        assert isinstance(outlier_not_removed_output[0], Tensor)
+        assert not torch.allclose(
+            outlier_removed_output[0], outlier_not_removed_output[0]
+        )
+
+
 def test__on_demand__result_equal_in_serial_and_in_parallel() -> None:
     rng = default_rng(seed=0)
     n_train = 100
@@ -139,22 +197,25 @@ def test__on_demand__result_equal_in_serial_and_in_parallel() -> None:
 
     num_models = 3
     models = [TestModel() for _ in range(num_models)]
-    engine = InferenceEngineOnDemand.prepare(
-        X_train,
-        y_train,
-        cat_ix=[] * n_train,
-        models=models,
-        devices=[torch.device("cpu")],
-        ensemble_configs=_create_test_ensemble_configs(
+    ensemble_preprocessor = TabPFNEnsemblePreprocessor(
+        configs=_create_test_ensemble_configs(
             n_configs=5,
             n_classes=3,
             num_models=num_models,
         ),
+        rng=rng,
         # We want to test n_preprocessing_jobs>1 as this might mean the outputs are not
         # in the same order as the input configs, and we want to check that the parallel
         # evaluation code behaves correctly in this scenario.
         n_preprocessing_jobs=5,
-        rng=rng,
+    )
+    engine = InferenceEngineOnDemand(
+        X_train,
+        y_train,
+        cat_ix=[] * n_train,
+        ensemble_preprocessor=ensemble_preprocessor,
+        models=models,
+        devices=[torch.device("cpu")],
         dtype_byte_size=4,
         force_inference_dtype=None,
         save_peak_mem=True,
@@ -181,6 +242,7 @@ def _create_test_ensemble_configs(
     n_configs: int,
     n_classes: int,
     num_models: int,
+    outlier_removal_std: float | None = None,
 ) -> list[ClassifierEnsembleConfig]:
     preprocessor_configs = [
         PreprocessorConfig(
@@ -196,7 +258,7 @@ def _create_test_ensemble_configs(
             max_features_per_estimator=500,
         ),
     ]
-    return EnsembleConfig.generate_for_classification(
+    return generate_classification_ensemble_configs(
         num_estimators=n_configs,
         subsample_samples=None,
         max_index=n_classes - 1,
@@ -208,6 +270,7 @@ def _create_test_ensemble_configs(
         n_classes=n_classes,
         random_state=0,
         num_models=num_models,
+        outlier_removal_std=outlier_removal_std,
     )
 
 

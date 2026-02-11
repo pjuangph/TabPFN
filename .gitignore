@@ -164,6 +164,7 @@ cython_debug/
 
 # Claude AI assistant
 CLAUDE.md
+.claude
 uv.lock
 *.jsonl
 *.pt

@@ -6,40 +6,30 @@ from __future__ import annotations
 
 import contextlib
 import os
-import typing
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal, Union
+from typing import TYPE_CHECKING, Literal, Union
 
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
 import torch
 from sklearn.base import (
     TransformerMixin,
-    check_is_fitted,
-    is_classifier,
 )
-from sklearn.utils.multiclass import check_classification_targets
 
-from tabpfn.architectures.base.encoders import (
-    MulticlassClassificationTargetEncoder,
-    SequentialEncoder,
+from tabpfn.architectures.encoders import (
+    MulticlassClassificationTargetEncoderStep,
+    TorchPreprocessingPipeline,
 )
 from tabpfn.constants import (
-    NA_PLACEHOLDER,
     REGRESSION_NAN_BORDER_LIMIT_LOWER,
     REGRESSION_NAN_BORDER_LIMIT_UPPER,
 )
-from tabpfn.misc._sklearn_compat import check_array, validate_data
 
 if TYPE_CHECKING:
     from sklearn.base import TransformerMixin
-    from sklearn.compose import ColumnTransformer
     from sklearn.pipeline import Pipeline
 
     from tabpfn.architectures.interface import Architecture
-    from tabpfn.classifier import TabPFNClassifier, XType, YType
-    from tabpfn.regressor import TabPFNRegressor
 
 MAXINT_RANDOM_SEED = int(np.iinfo(np.int32).max)
 
@@ -59,67 +49,6 @@ def get_autocast_context(
     if device.type == "mps":
         return contextlib.nullcontext()
     return torch.autocast(device.type, enabled=enabled)
-
-
-def get_embeddings(
-    model: TabPFNClassifier | TabPFNRegressor,
-    X: XType,
-    data_source: Literal["train", "test"] = "test",
-) -> np.ndarray:
-    """Extract embeddings from a fitted TabPFN model.
-
-    Args:
-        model : TabPFNClassifier | TabPFNRegressor
-            The fitted classifier or regressor.
-        X : XType
-            The input data.
-        data_source : {"train", "test"}, default="test"
-            Select the transformer output to return. Use ``"train"`` to obtain
-            embeddings from the training tokens and ``"test"`` for the test tokens.
-
-    Returns:
-        np.ndarray
-            The computed embeddings for each fitted estimator.
-            When ``n_estimators > 1`` the returned array has shape
-            ``(n_estimators, n_samples, embedding_dim)``. You can average over the
-            first axis or reshape to concatenate the estimators, e.g.:
-
-                emb = get_embeddings(model, X)
-                emb_avg = emb.mean(axis=0)
-                emb_concat = emb.reshape(emb.shape[1], -1)
-    """
-    check_is_fitted(model)
-
-    data_map = {"train": "train_embeddings", "test": "test_embeddings"}
-
-    selected_data = data_map[data_source]
-
-    # Avoid circular imports
-    from tabpfn.preprocessing import (  # noqa: PLC0415
-        ClassifierEnsembleConfig,
-        RegressorEnsembleConfig,
-    )
-
-    X = validate_X_predict(X, model)
-    X = fix_dtypes(X, cat_indices=model.categorical_features_indices)
-    X = model.preprocessor_.transform(X)
-
-    embeddings: list[np.ndarray] = []
-
-    # Cast executor to Any to bypass the iter_outputs signature check
-    for output, config in model.executor_.iter_outputs(
-        X,
-        autocast=model.use_autocast_,
-        only_return_standard_out=False,
-    ):
-        # Cast output to Any to allow dict-like access
-        output_dict = typing.cast("dict[str, torch.Tensor]", output)
-        embed = output_dict[selected_data].squeeze(1)
-        assert isinstance(config, (ClassifierEnsembleConfig, RegressorEnsembleConfig))
-        assert embed.ndim == 2
-        embeddings.append(embed.squeeze().cpu().numpy())
-
-    return np.array(embeddings)
 
 
 def _repair_borders(borders: np.ndarray, *, inplace: Literal[True]) -> None:
@@ -345,238 +274,6 @@ def infer_fp16_inference_mode(
     raise ValueError(f"Unrecognized argument '{enable}'")
 
 
-# https://numpy.org/doc/2.1/reference/arrays.dtypes.html#checking-the-data-type
-NUMERIC_DTYPE_KINDS = "?bBiufm"
-OBJECT_DTYPE_KINDS = "OV"
-STRING_DTYPE_KINDS = "SaU"
-UNSUPPORTED_DTYPE_KINDS = "cM"  # Not needed, just for completeness
-
-
-def fix_dtypes(  # noqa: D103
-    X: pd.DataFrame | np.ndarray,
-    cat_indices: Sequence[int | str] | None,
-    numeric_dtype: Literal["float32", "float64"] = "float64",
-) -> pd.DataFrame:
-    if isinstance(X, pd.DataFrame):
-        # This will help us get better dtype inference later
-        convert_dtype = True
-    elif isinstance(X, np.ndarray):
-        if X.dtype.kind in NUMERIC_DTYPE_KINDS:
-            # It's a numeric type, just wrap the array in pandas with the correct dtype
-            X = pd.DataFrame(X, copy=False, dtype=numeric_dtype)
-            convert_dtype = False
-        elif X.dtype.kind in OBJECT_DTYPE_KINDS:
-            # If numpy and object dype, we rely on pandas to handle introspection
-            # of columns and rows to determine the dtypes.
-            X = pd.DataFrame(X, copy=True)
-            convert_dtype = True
-        elif X.dtype.kind in STRING_DTYPE_KINDS:
-            raise ValueError(
-                f"String dtypes are not supported. Got dtype: {X.dtype}",
-            )
-        else:
-            raise ValueError(f"Invalid dtype for X: {X.dtype}")
-    else:
-        raise ValueError(f"Invalid type for X: {type(X)}")
-
-    if cat_indices is not None:
-        # So annoyingly, things like AutoML Benchmark may sometimes provide
-        # numeric indices for categoricals, while providing named columns in the
-        # dataframe. Equally, dataframes loaded from something like a csv may just have
-        # integer column names, and so it makes sense to access them just like you would
-        # string columns.
-        # Hence, we check if the types match and decide whether to use `iloc` to select
-        # columns, or use the indices as column names...
-        is_numeric_indices = all(isinstance(i, (int, np.integer)) for i in cat_indices)
-        columns_are_numeric = all(
-            isinstance(col, (int, np.integer)) for col in X.columns.tolist()
-        )
-        use_iloc = is_numeric_indices and not columns_are_numeric
-        if use_iloc:
-            X.iloc[:, cat_indices] = X.iloc[:, cat_indices].astype("category")
-        else:
-            X[cat_indices] = X[cat_indices].astype("category")
-
-    # Alright, pandas can have a few things go wrong.
-    #
-    # 1. Of course, object dtypes, `convert_dtypes()` will handle this for us if
-    #   possible. This will raise later if can't convert.
-    # 2. String dtypes can still exist, OrdinalEncoder will do something but
-    #   it's not ideal. We should probably check unique counts at the expense of doing
-    #   so.
-    # 3. For all dtypes relating to timeseries and other _exotic_ types not supported by
-    #   numpy, we leave them be and let the pipeline error out where it will.
-    # 4. Pandas will convert dtypes to Int64Dtype/Float64Dtype, which include
-    #   `pd.NA`. Sklearn's Ordinal encoder treats this differently than `np.nan`.
-    #   We can fix this one by converting all numeric columns to float64, which uses
-    #   `np.nan` instead of `pd.NA`.
-    #
-    if convert_dtype:
-        X = X.convert_dtypes()
-
-    integer_columns = X.select_dtypes(include=["number"]).columns
-    if len(integer_columns) > 0:
-        X[integer_columns] = X[integer_columns].astype(numeric_dtype)
-    return X
-
-
-def validate_Xy_fit(
-    X: XType,
-    y: YType,
-    estimator: TabPFNRegressor | TabPFNClassifier,
-    *,
-    max_num_features: int,
-    max_num_samples: int,
-    ensure_y_numeric: bool = False,
-    ignore_pretraining_limits: bool = False,
-) -> tuple[np.ndarray, np.ndarray, npt.NDArray[Any] | None, int]:
-    """Validate the input data for fitting."""
-    # Calls `validate_data()` with specification
-
-    # Checks that we do not call validate_data() in case
-    # the Prompttuning is enabled, since it is not differentiable.
-    # TODO: update then Prompttuning is enabled for diffable models
-    if not is_classifier(estimator) or (
-        is_classifier(estimator) and not estimator.differentiable_input
-    ):
-        X, y = validate_data(
-            estimator,
-            X=X,
-            y=y,
-            # Parameters to `check_X_y()`
-            accept_sparse=False,
-            dtype=None,  # This is handled later in `fit()`
-            ensure_all_finite="allow-nan",
-            ensure_min_samples=2,
-            ensure_min_features=1,
-            y_numeric=ensure_y_numeric,
-            estimator=estimator,
-        )
-    else:  # Quick check for tensor input for diffable classifier
-        assert isinstance(X, torch.Tensor)
-        assert isinstance(y, torch.Tensor)
-        assert len(X) == len(y)
-        assert len(X.shape) == 2
-        estimator.n_features_in_ = X.shape[1]
-
-    if X.shape[1] > max_num_features and not ignore_pretraining_limits:
-        raise ValueError(
-            f"Number of features {X.shape[1]} in the input data is greater than "
-            f"the maximum number of features {max_num_features} officially "
-            "supported by the TabPFN model. Set `ignore_pretraining_limits=True` "
-            "to override this error!",
-        )
-    if X.shape[0] > max_num_samples and not ignore_pretraining_limits:
-        raise ValueError(
-            f"Number of samples {X.shape[0]} in the input data is greater than "
-            f"the maximum number of samples {max_num_samples} officially supported"
-            f" by TabPFN. Set `ignore_pretraining_limits=True` to override this "
-            f"error!",
-        )
-
-    if is_classifier(estimator) and not estimator.differentiable_input:
-        check_classification_targets(y)
-        # Annoyingly, the `ensure_all_finite` above only applies to `X` and
-        # there is no way to specify this for `y`. The validation check above
-        # will also only check for NaNs in `y` if `multi_output=True` which is
-        # something we don't want. Hence, we run another check on `y` here.
-        # However we also have to consider if ther dtype is a string type,
-        # then
-        y = check_array(
-            y,
-            accept_sparse=False,
-            ensure_all_finite=True,
-            dtype=None,  # type: ignore
-            ensure_2d=False,
-        )
-
-    # NOTE: Theoretically we don't need to return the feature names and number,
-    # but it makes it clearer in the calling code that these variables now exist
-    # and can be set on the estimator.
-
-    return X, y, getattr(estimator, "feature_names_in_", None), estimator.n_features_in_
-
-
-def validate_X_predict(
-    X: XType,
-    estimator: TabPFNRegressor | TabPFNClassifier,
-) -> np.ndarray:
-    """Validate the input data for prediction."""
-    result = validate_data(
-        estimator,
-        X=X,
-        # NOTE: Important that reset is False, i.e. doesn't reset estimator
-        reset=False,
-        # Parameters to `check_X_y()`
-        accept_sparse=False,
-        dtype=None,
-        ensure_all_finite="allow-nan",
-        estimator=estimator,
-    )
-    return typing.cast("np.ndarray", result)
-
-
-def infer_categorical_features(
-    X: np.ndarray,
-    *,
-    provided: Sequence[int] | None,
-    min_samples_for_inference: int,
-    max_unique_for_category: int,
-    min_unique_for_numerical: int,
-) -> list[int]:
-    """Infer the categorical features from the given data.
-
-    !!! note
-
-        This function may infer particular columns to not be categorical
-        as defined by what suits the model predictions and it's pre-training.
-
-    Args:
-        X: The data to infer the categorical features from.
-        provided: Any user provided indices of what is considered categorical.
-        min_samples_for_inference:
-            The minimum number of samples required
-            for automatic inference of features which were not provided
-            as categorical.
-        max_unique_for_category:
-            The maximum number of unique values for a
-            feature to be considered categorical.
-        min_unique_for_numerical:
-            The minimum number of unique values for a
-            feature to be considered numerical.
-
-    Returns:
-        The indices of inferred categorical features.
-    """
-    # We presume everything is numerical and go from there
-    maybe_categoricals = () if provided is None else provided
-    large_enough_x_to_infer_categorical = X.shape[0] > min_samples_for_inference
-    indices = []
-
-    for ix, col in enumerate(X.T):
-        # Calculate total distinct values once, treating NaN as a category.
-        try:
-            s = pd.Series(col)
-            # counts NaN/None as a category
-            num_distinct = s.nunique(dropna=False)
-        except TypeError as e:
-            # e.g. "unhashable type: 'dict'" when object arrays contain dicts
-            raise TypeError(
-                "argument must be a string or a number"
-                "(columns must only contain strings or numbers)"
-            ) from e
-        if ix in maybe_categoricals:
-            if num_distinct <= max_unique_for_category:
-                indices.append(ix)
-        elif (
-            large_enough_x_to_infer_categorical
-            and num_distinct < min_unique_for_numerical
-        ):
-            indices.append(ix)
-
-    return indices
-
-
 def infer_random_state(
     random_state: int | np.random.RandomState | np.random.Generator | None,
 ) -> tuple[int, np.random.Generator]:
@@ -604,43 +301,6 @@ def infer_random_state(
         raise ValueError(f"Invalid random_state {random_state}")
 
     return static_seed, np_rng
-
-
-def process_text_na_dataframe(
-    X: pd.DataFrame,
-    placeholder: str = NA_PLACEHOLDER,
-    ord_encoder: ColumnTransformer | None = None,
-    *,
-    fit_encoder: bool = False,
-) -> np.ndarray:
-    """Convert `X` to float64, replacing NA with NaN in string cells.
-
-    If `ord_encoder` is not None, then it will be used to encode `X` before the
-    conversion to float64.
-
-    Note that this function sometimes mutates its input.
-    """
-    # Replace NAN values in X, for dtypes, which the OrdinalEncoder cannot handle
-    # with placeholder NAN value. Later placeholder NAN values are transformed to np.nan
-    string_cols = X.select_dtypes(include=["string", "object"]).columns
-    if len(string_cols) > 0:
-        X[string_cols] = X[string_cols].fillna(placeholder)
-
-    if fit_encoder and ord_encoder is not None:
-        X_encoded = ord_encoder.fit_transform(X)
-    elif ord_encoder is not None:
-        X_encoded = ord_encoder.transform(X)
-    else:
-        X_encoded = X
-
-    string_cols_ix = [X.columns.get_loc(col) for col in string_cols]
-    placeholder_mask = X[string_cols] == placeholder
-    X_encoded[:, string_cols_ix] = np.where(
-        placeholder_mask,
-        np.nan,
-        X_encoded[:, string_cols_ix],
-    )
-    return X_encoded.astype(np.float64)
 
 
 def _map_to_bucket_ix(y: torch.Tensor, borders: torch.Tensor) -> torch.Tensor:
@@ -697,71 +357,25 @@ def translate_probs_across_borders(
     return (prob_left[..., 1:] - prob_left[..., :-1]).clamp_min(0.0)
 
 
-def update_encoder_params(
+def remove_non_differentiable_preprocessing_from_models(
     models: list[Architecture],
-    remove_outliers_std: float | None,
-    seed: int | None,
-    *,
-    differentiable_input: bool = False,
 ) -> None:
-    """Update the loaded encoder elements and setting to be compatible with inference
-    requirements. This concerns handling outliers in the model and also removes
-    non-differentiable steps from the label encoder.
-
-    !!! warning
-
-        This only happens inplace.
+    """Remove non-differentiable encoder steps from the model.
 
     Args:
         models: The models to update.
-        remove_outliers_std: The standard deviation to remove outliers.
-        seed: The seed to use, if any.
-        inplace: Whether to do the operation inplace.
-        differentiable_input: Whether the entire model including forward pass should
-            be differentiable with pt autograd. This disables non-differentiable
-            encoder steps.
     """
-    if remove_outliers_std is not None and remove_outliers_std <= 0:
-        raise ValueError("remove_outliers_std must be greater than 0")
-
     for model in models:
-        # TODO: find a less hacky way to change settings during training
-        # and inference
-        if not hasattr(model, "encoder"):
-            raise ValueError(
-                "Model does not have an encoder, this breaks the TabPFN sklearn "
-                "wrapper."
-            )
+        diffable_steps = []  # only differentiable encoder steps.
+        for module in model.y_encoder:
+            if isinstance(module, MulticlassClassificationTargetEncoderStep):
+                pass
+            else:
+                diffable_steps.append(module)
 
-        encoder = model.encoder
-
-        # TODO: maybe check that norm_layer even exists
-        norm_layer = next(
-            e for e in encoder if "InputNormalizationEncoderStep" in str(e.__class__)
+        model.y_encoder = TorchPreprocessingPipeline(
+            steps=diffable_steps, output_key="output"
         )
-        if not hasattr(norm_layer, "remove_outliers"):
-            raise ValueError(
-                "InputNormalizationEncoderStep does not have a remove_outliers "
-                "attribute, this will break the TabPFN sklearn wrapper."
-            )
-        norm_layer.remove_outliers = (remove_outliers_std is not None) and (
-            remove_outliers_std > 0
-        )
-        if norm_layer.remove_outliers:
-            norm_layer.remove_outliers_sigma = remove_outliers_std
-
-        norm_layer.seed = seed
-        norm_layer.reset_seed()
-
-        if differentiable_input:
-            diffable_steps = []  # only differentiable encoder steps.
-            for module in model.y_encoder:
-                if isinstance(module, MulticlassClassificationTargetEncoder):
-                    pass
-                else:
-                    diffable_steps.append(module)
-
-            model.y_encoder = SequentialEncoder(*diffable_steps)
 
 
 def transform_borders_one(
@@ -813,62 +427,6 @@ def transform_borders_one(
     return logit_cancel_mask, descending_borders, borders_t
 
 
-def split_large_data(
-    largeX: XType,
-    largey: YType,
-    max_data_size: int,
-    *,
-    equal_split_size: bool,
-) -> tuple[list[XType], list[YType]]:
-    """Split a large dataset into chunks along the first dimension.
-
-    Args:
-        largeX: features
-        largey: labels
-        max_data_size: int that indicates max size of a chunks.
-            We chose the minimum number of chunks that keeps each chunk under
-            max_data_size.
-        equal_split_size: If True, splits data into equally sized chunks under
-            max_data_size.
-            If False, splits into chunks of size `max_data_size`, with
-            the last chunk having the remainder samples but is dropped if its
-            size is less than 2.
-    """
-    tot_size = len(largeX)
-    if max_data_size <= 0:
-        raise ValueError("max_data_size must be positive")
-    if tot_size == 0:
-        return [], []
-
-    if not equal_split_size:
-        MIN_BATCH_SIZE = 2
-
-        xlst, ylst = [], []
-        offset = 0
-        while offset + max_data_size <= tot_size:
-            xlst.append(largeX[offset : offset + max_data_size])
-            ylst.append(largey[offset : offset + max_data_size])
-            offset += max_data_size
-
-        if tot_size - offset >= MIN_BATCH_SIZE:
-            xlst.append(largeX[offset:])
-            ylst.append(largey[offset:])
-
-        return xlst, ylst
-    num_chunks = ((tot_size - 1) // max_data_size) + 1
-    basechunk_size = tot_size // num_chunks
-    remainder = tot_size % num_chunks
-
-    offset = 0
-    xlst, ylst = [], []
-    for b in range(num_chunks):
-        chunk_sz = basechunk_size + (1 if b < remainder else 0)
-        xlst.append(largeX[offset : offset + chunk_sz])
-        ylst.append(largey[offset : offset + chunk_sz])
-        offset += chunk_sz
-    return xlst, ylst
-
-
 def pad_tensors(
     tensor_list: list[torch.Tensor],
     padding_val: float | None = 0,
@@ -899,76 +457,6 @@ def pad_tensors(
         )
         ret_list.append(padded_item)
     return ret_list
-
-
-def meta_dataset_collator(batch: list, padding_val: float = 0.0) -> tuple:
-    """Collate function for torch.utils.data.DataLoader.
-
-    Designed for batches from DatasetCollectionWithPreprocessing.
-    Takes a list of dataset samples (the batch) and structures them
-    into a single tuple suitable for model input, often for fine-tuning
-    using `fit_from_preprocessed`.
-
-    Handles samples containing nested lists (e.g., for ensemble members)
-    and tensors. Pads tensors to consistent shapes using `pad_tensors`
-    before stacking. Non-tensor items are grouped into lists.
-
-    Args:
-        batch (list): A list where each element is one sample from the
-            Dataset. Samples often contain multiple components like
-            features, labels, configs, etc., potentially nested in lists.
-        padding_val (float): Value used for padding tensors to allow
-            stacking across the batch dimension.
-
-    Returns:
-        tuple: A tuple where each element is a collated component from the
-            input batch (e.g., stacked tensors, lists of configs).
-            The structure matches the input required by methods like
-            `fit_from_preprocessed`.
-
-    Note:
-        Currently only implemented and tested for `batch_size = 1`,
-        as enforced by an internal assertion.
-    """
-    batch_sz = len(batch)
-    assert batch_sz == 1, "Only Implemented and tested for batch size of 1"
-    num_estim = len(batch[0][0])
-    items_list = []
-    for item_idx in range(len(batch[0])):
-        if isinstance(batch[0][item_idx], list):
-            estim_list = []
-            for estim_no in range(num_estim):
-                if isinstance(batch[0][item_idx][0], torch.Tensor):
-                    labels = batch[0][item_idx][0].ndim == 1
-                    estim_list.append(
-                        torch.stack(
-                            pad_tensors(
-                                [batch[r][item_idx][estim_no] for r in range(batch_sz)],
-                                padding_val=padding_val,
-                                labels=labels,
-                            )
-                        )
-                    )
-                else:
-                    estim_list.append(
-                        list(batch[r][item_idx][estim_no] for r in range(batch_sz))  # noqa: C400
-                    )
-            items_list.append(estim_list)
-        elif isinstance(batch[0][item_idx], torch.Tensor):
-            labels = batch[0][item_idx].ndim == 1
-            items_list.append(
-                torch.stack(
-                    pad_tensors(
-                        [batch[r][item_idx] for r in range(batch_sz)],
-                        padding_val=padding_val,
-                        labels=labels,
-                    )
-                )
-            )
-        else:
-            items_list.append([batch[r][item_idx] for r in range(batch_sz)])
-
-    return tuple(items_list)
 
 
 def balance_probas_by_class_counts(
