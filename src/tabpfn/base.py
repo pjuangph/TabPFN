@@ -41,12 +41,6 @@ from tabpfn.model_loading import (
     load_model_criterion_config,
     resolve_model_version,
 )
-from tabpfn.preprocessing import (
-    BaseDatasetConfig,
-    ClassifierDatasetConfig,
-    DatasetCollectionWithPreprocessing,
-    RegressorDatasetConfig,
-)
 from tabpfn.settings import settings
 from tabpfn.model_loading import load_model_criterion_config, resolve_model_version
 from tabpfn.preprocessing.clean import fix_dtypes

@@ -38,8 +38,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from tabpfn import TabPFNRegressor
-from tabpfn.finetune_utils import clone_model_for_evaluation
-from tabpfn.utils import meta_dataset_collator
+from tabpfn.finetuning.train_util import clone_model_for_evaluation
+from tabpfn.finetuning.data_util import get_preprocessed_dataset_chunks, meta_dataset_collator
 
 from housing_regression_utils import (
     append_jsonl,
@@ -230,11 +230,15 @@ def main() -> None:
             rng=rng,
         )
 
-        training_datasets = regressor.get_preprocessed_datasets(
-            X_contexts,
-            y_contexts,
-            splitter,
+        training_datasets = get_preprocessed_dataset_chunks(
+            calling_instance=regressor,
+            X_raw=X_contexts,
+            y_raw=y_contexts,
+            split_fn=splitter,
             max_data_size=None,
+            model_type="regressor",
+            equal_split_size=True,
+            seed=args.seed + epoch,
         )
 
         # `batch_size=1` here means "one dataset/context per step".
@@ -246,25 +250,16 @@ def main() -> None:
 
         for batch in progress:
             optimizer.zero_grad(set_to_none=True)
-            (
-                X_trains_preprocessed,
-                X_tests_preprocessed,
-                y_trains_znorm,
-                y_test_znorm,
-                cat_ixs,
-                confs,
-                _raw_space_bardist,
-                znorm_space_bardist,
-                _,
-                _y_test_raw,
-            ) = batch
 
-            regressor.znorm_space_bardist_ = znorm_space_bardist[0]
-            regressor.fit_from_preprocessed(X_trains_preprocessed, y_trains_znorm, cat_ixs, confs)
-            logits, _, _ = regressor.forward(X_tests_preprocessed)
+            regressor.raw_space_bardist_ = batch.raw_space_bardist
+            regressor.znorm_space_bardist_ = batch.znorm_space_bardist
+            regressor.fit_from_preprocessed(
+                batch.X_context, batch.y_context, batch.cat_indices, batch.configs,
+            )
+            logits, _, _ = regressor.forward(batch.X_query)
 
-            loss_fn = znorm_space_bardist[0]
-            loss = loss_fn(logits, y_test_znorm.to(args.device)).mean()
+            loss_fn = batch.znorm_space_bardist
+            loss = loss_fn(logits, batch.y_query.to(args.device)).mean()
             loss.backward()
             grad_norm = float(clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm))
             optimizer.step()
